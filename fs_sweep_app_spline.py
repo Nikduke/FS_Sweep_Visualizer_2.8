@@ -2,6 +2,9 @@ import os
 import hashlib
 import json
 from typing import Dict, List, Tuple, Optional
+
+# Main app baseline (no zoom persistence).
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -43,6 +46,91 @@ AUTO_WIDTH_ESTIMATE_PX = 950  # Estimate width when Plotly auto-sizes (used for 
 WEB_LEGEND_MAX_HEIGHT_PX = 500  # Cap legend reserved area on-page to avoid huge gaps between charts.
 DEFAULT_SPLINE_SMOOTHING = 1.0  # Default Plotly spline smoothing when spline mode is enabled.
 EXPORT_IMAGE_SCALE = 4  # PNG scale factor for both modebar and "Full Legend" export.
+
+# Debug flag (code-only). When True, prints the latest relayout payload and stored zoom.
+DEBUG_ZOOM = False
+
+_plotly_relayout_listener = components.declare_component(
+    "plotly_relayout_listener",
+    path=str(os.path.join(os.path.dirname(__file__), "plotly_relayout_listener")),
+)
+
+
+def plotly_relayout_listener(
+    data_id: str,
+    plot_count: int = 3,
+    debounce_ms: int = 120,
+    nonce: int = 0,
+) -> Optional[Dict[str, object]]:
+    # Returns the most recent relayout payload sent from the browser, or None.
+    return _plotly_relayout_listener(  # type: ignore[misc]
+        data_id=str(data_id),
+        plot_count=int(plot_count),
+        debounce_ms=int(debounce_ms),
+        nonce=int(nonce),
+        key=f"plotly_relayout_listener:{data_id}",
+        default=None,
+    )
+
+
+def _update_zoom_state_from_relayout(evt: Optional[Dict[str, object]], data_id: str) -> None:
+    if not evt:
+        return
+    if str(evt.get("data_id", "")) != str(data_id):
+        return
+
+    try:
+        plot_index = int(evt.get("plot_index"))  # type: ignore[arg-type]
+    except Exception:
+        return
+
+    store_key = f"zoom_ranges:{data_id}"
+    store = st.session_state.get(store_key)
+    if not isinstance(store, dict):
+        store = {}
+
+    entry = store.get(plot_index)
+    if not isinstance(entry, dict):
+        entry = {}
+
+    if evt.get("xautorange") is True:
+        entry.pop("x", None)
+    elif "x0" in evt and "x1" in evt:
+        try:
+            entry["x"] = [float(evt["x0"]), float(evt["x1"])]  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    if evt.get("yautorange") is True:
+        entry.pop("y", None)
+    elif "y0" in evt and "y1" in evt:
+        try:
+            entry["y"] = [float(evt["y0"]), float(evt["y1"])]  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+    if entry:
+        store[plot_index] = entry
+    else:
+        store.pop(plot_index, None)
+
+    st.session_state[store_key] = store
+
+
+def _apply_saved_zoom(fig: go.Figure, plot_index: int, data_id: str) -> None:
+    store = st.session_state.get(f"zoom_ranges:{data_id}")
+    if not isinstance(store, dict):
+        return
+    entry = store.get(int(plot_index))
+    if not isinstance(entry, dict):
+        return
+
+    xr = entry.get("x")
+    yr = entry.get("y")
+    if isinstance(xr, list) and len(xr) == 2:
+        fig.update_xaxes(range=[float(xr[0]), float(xr[1])], autorange=False)
+    if isinstance(yr, list) and len(yr) == 2:
+        fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False)
 
 
 def _clamp_int(val: int, lo: int, hi: int) -> int:
@@ -274,7 +362,6 @@ def load_fs_sweep_xlsx(path_or_buf) -> Dict[str, pd.DataFrame]:
                     continue
                 series_map[c] = df[c].to_numpy(copy=False)
             df.attrs["__prepared_arrays__"] = (freq_hz, series_map)
-
             dfs[name] = df
     return dfs
 
@@ -475,7 +562,6 @@ def apply_common_layout(
     n_traces: int,
     use_auto_width: bool,
     figure_width_px: int,
-    uirevision_key: str,
 ):
     font_base = dict(family=STYLE["font_family"], color=STYLE["font_color"])
     # Reserve legend space below the plot so the legend stays at the bottom on-page.
@@ -504,8 +590,8 @@ def apply_common_layout(
     fig.update_layout(
         autosize=bool(use_auto_width),
         height=total_height,
-        # Keep zoom/pan on Streamlit reruns; include file id in the key so loading a new file resets zoom.
-        uirevision=str(uirevision_key),
+        # Keep zoom/pan on Streamlit reruns (including when case list changes).
+        uirevision="keep",
         font=dict(
             **font_base,
             size=int(STYLE["base_font_size_px"]),
@@ -571,11 +657,11 @@ def apply_common_layout(
 
 def build_plot_spline(df: Optional[pd.DataFrame], cases: List[str], f_base: float, plot_height: int, y_title: str,
                       smooth: float, enable_spline: bool, legend_entrywidth: int, strip_location_suffix: bool,
-                      use_auto_width: bool, figure_width_px: int, case_colors: Dict[str, str], uirevision_key: str
+                      use_auto_width: bool, figure_width_px: int, case_colors: Dict[str, str]
                       ) -> Tuple[go.Figure, Optional[pd.Series]]:
     traces, f_series = make_spline_traces(df, cases, f_base, y_title, smooth, enable_spline, strip_location_suffix, case_colors)
     fig = go.Figure(data=traces)
-    apply_common_layout(fig, plot_height, y_title, legend_entrywidth, len(traces), use_auto_width, figure_width_px, uirevision_key=uirevision_key)
+    apply_common_layout(fig, plot_height, y_title, legend_entrywidth, len(traces), use_auto_width, figure_width_px)
     return fig, f_series
 
 
@@ -583,7 +669,7 @@ def build_x_over_r_spline(df_r: Optional[pd.DataFrame], df_x: Optional[pd.DataFr
                           plot_height: int, seq_label: str, smooth: float, legend_entrywidth: int,
                           enable_spline: bool,
                           strip_location_suffix: bool, use_auto_width: bool, figure_width_px: int,
-                          case_colors: Dict[str, str], uirevision_key: str
+                          case_colors: Dict[str, str]
                           ) -> Tuple[go.Figure, Optional[pd.Series], int, int]:
     fig = go.Figure()
     xr_dropped = 0
@@ -622,7 +708,7 @@ def build_x_over_r_spline(df_r: Optional[pd.DataFrame], df_x: Optional[pd.DataFr
                 tr.update(line=dict(shape="spline", smoothing=float(smooth), simplify=False, color=color))
             fig.add_trace(tr)
     y_title = "X1/R1 (unitless)" if seq_label == "Positive" else "X0/R0 (unitless)"
-    apply_common_layout(fig, plot_height, y_title, legend_entrywidth, len(fig.data), use_auto_width, figure_width_px, uirevision_key=uirevision_key)
+    apply_common_layout(fig, plot_height, y_title, legend_entrywidth, len(fig.data), use_auto_width, figure_width_px)
     return fig, f_series, xr_dropped, xr_total
 
 
@@ -817,83 +903,6 @@ def _render_client_png_download(
     components.html(html, height=70)
 
 
-_plotly_relayout_listener = components.declare_component(
-    "plotly_relayout_listener",
-    path=str(os.path.join(os.path.dirname(__file__), "plotly_relayout_listener")),
-)
-
-
-def plotly_relayout_listener(data_id: str, plot_count: int = 3, debounce_ms: int = 120) -> Optional[Dict[str, object]]:
-    # Returns the most recent relayout payload sent from the browser, or None.
-    return _plotly_relayout_listener(  # type: ignore[misc]
-        data_id=str(data_id),
-        plot_count=int(plot_count),
-        debounce_ms=int(debounce_ms),
-        key=f"plotly_relayout_listener:{data_id}",
-        default=None,
-    )
-
-
-def _update_zoom_state_from_relayout(evt: Optional[Dict[str, object]], data_id: str) -> None:
-    if not evt:
-        return
-    if str(evt.get("data_id", "")) != str(data_id):
-        return
-
-    try:
-        plot_index = int(evt.get("plot_index"))  # type: ignore[arg-type]
-    except Exception:
-        return
-
-    store_key = f"zoom_ranges:{data_id}"
-    store = st.session_state.get(store_key)
-    if not isinstance(store, dict):
-        store = {}
-
-    entry = store.get(plot_index)
-    if not isinstance(entry, dict):
-        entry = {}
-
-    if evt.get("xautorange") is True:
-        entry.pop("x", None)
-    else:
-        if "x0" in evt and "x1" in evt:
-            try:
-                entry["x"] = [float(evt["x0"]), float(evt["x1"])]  # type: ignore[arg-type]
-            except Exception:
-                pass
-
-    if evt.get("yautorange") is True:
-        entry.pop("y", None)
-    else:
-        if "y0" in evt and "y1" in evt:
-            try:
-                entry["y"] = [float(evt["y0"]), float(evt["y1"])]  # type: ignore[arg-type]
-            except Exception:
-                pass
-
-    store[plot_index] = entry
-    st.session_state[store_key] = store
-
-
-def _apply_saved_zoom(fig: go.Figure, plot_index: int, data_id: str) -> None:
-    store = st.session_state.get(f"zoom_ranges:{data_id}")
-    if not isinstance(store, dict):
-        return
-    entry = store.get(int(plot_index))
-    if not isinstance(entry, dict):
-        return
-
-    xr = entry.get("x")
-    yr = entry.get("y")
-    if isinstance(xr, list) and len(xr) == 2:
-        fig.update_xaxes(range=[float(xr[0]), float(xr[1])], autorange=False)
-    if isinstance(yr, list) and len(yr) == 2:
-        fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False)
-
-
-
-
 def main():
     st.title("FS Sweep Visualizer (Spline)")
 
@@ -906,8 +915,7 @@ def main():
         if up is not None:
             data = load_fs_sweep_xlsx(up)
             try:
-                b = up.getvalue()
-                data_id = hashlib.sha1(b).hexdigest()[:10]
+                data_id = hashlib.sha1(up.getvalue()).hexdigest()[:10]
             except Exception:
                 data_id = f"upload:{getattr(up, 'name', 'file')}"
         elif os.path.exists(default_path):
@@ -1013,11 +1021,24 @@ def main():
     show_harmonics = st.sidebar.checkbox("Show harmonic lines", value=True)
     bin_width_hz = st.sidebar.number_input("Bin width (Hz)", min_value=0.0, value=0.0, step=1.0, help="0 disables tolerance bands")
 
+    # Capture last zoom/pan/reset from the browser and store it in session_state for this file.
+    bind_nonce_key = f"zoom_bind_nonce:{data_id}"
+    st.session_state[bind_nonce_key] = int(st.session_state.get(bind_nonce_key, 0)) + 1
+
+    relayout_evt = plotly_relayout_listener(
+        data_id=data_id,
+        plot_count=3,
+        debounce_ms=150,
+        nonce=int(st.session_state[bind_nonce_key]),
+    )
+    _update_zoom_state_from_relayout(relayout_evt, data_id=data_id)
+    if DEBUG_ZOOM:
+        st.sidebar.write("relayout_evt:", relayout_evt)
+        st.sidebar.write("zoom_store:", st.session_state.get(f"zoom_ranges:{data_id}"))
+
     # Build plots
     r_title = "R1 (\u03A9)" if seq_label == "Positive" else "R0 (\u03A9)"
     x_title = "X1 (\u03A9)" if seq_label == "Positive" else "X0 (\u03A9)"
-    zoom_key = f"zoom:{data_id}"
-
     fig_r, f_r = build_plot_spline(
         df_r,
         filtered_cases,
@@ -1031,7 +1052,6 @@ def main():
         use_auto_width,
         figure_width_px,
         case_colors,
-        uirevision_key=f"{zoom_key}:r",
     )
     fig_x, f_x = build_plot_spline(
         df_x,
@@ -1046,7 +1066,6 @@ def main():
         use_auto_width,
         figure_width_px,
         case_colors,
-        uirevision_key=f"{zoom_key}:x",
     )
     fig_xr, f_xr, xr_dropped, xr_total = build_x_over_r_spline(
         df_r,
@@ -1062,7 +1081,6 @@ def main():
         use_auto_width,
         figure_width_px,
         case_colors,
-        uirevision_key=f"{zoom_key}:xr",
     )
 
     f_refs = [s for s in [f_r, f_x, f_xr] if s is not None]
@@ -1073,9 +1091,7 @@ def main():
         if harm_shapes:
             fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
 
-    # Capture and persist user zoom/pan (relayout) events in session_state, then reapply them.
-    relayout_evt = plotly_relayout_listener(data_id=data_id, plot_count=3, debounce_ms=150)
-    _update_zoom_state_from_relayout(relayout_evt, data_id=data_id)
+    # Reapply saved zoom (overrides the default n-range above).
     _apply_saved_zoom(fig_x, plot_index=0, data_id=data_id)
     _apply_saved_zoom(fig_r, plot_index=1, data_id=data_id)
     _apply_saved_zoom(fig_xr, plot_index=2, data_id=data_id)
@@ -1094,7 +1110,7 @@ def main():
             _render_client_png_download(
                 filename="X_full_legend.png",
                 scale=export_scale,
-                button_label="X PNG",
+                button_label="X\nPNG",
                 plot_height=plot_height,
                 legend_entrywidth=legend_entrywidth,
                 plot_index=0,
@@ -1103,7 +1119,7 @@ def main():
             _render_client_png_download(
                 filename="R_full_legend.png",
                 scale=export_scale,
-                button_label="R PNG",
+                button_label="R\nPNG",
                 plot_height=plot_height,
                 legend_entrywidth=legend_entrywidth,
                 plot_index=1,
@@ -1112,7 +1128,7 @@ def main():
             _render_client_png_download(
                 filename="X_over_R_full_legend.png",
                 scale=export_scale,
-                button_label="X/R PNG",
+                button_label="X/R\nPNG",
                 plot_height=plot_height,
                 legend_entrywidth=legend_entrywidth,
                 plot_index=2,
