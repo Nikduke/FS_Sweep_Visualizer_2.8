@@ -874,14 +874,10 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
 	    <script>
 	      (function () {{
 	        const parentWin = window.parent || window;
-        const installTag = "fs_sweep_zoom_qp_v4";
-        try {{
-          if (parentWin.__fsSweepZoomQPInstalled === installTag && typeof parentWin.__fsSweepZoomQPKick === "function") {{
-            parentWin.__fsSweepZoomQPKick();
-            return;
-          }}
-          parentWin.__fsSweepZoomQPInstalled = installTag;
-        }} catch (e) {{}}
+	        // Always (re)install: Streamlit can keep old JS alive; a global "installed" flag can freeze old behavior.
+	        // Use a per-run token so only the latest injected script stays active.
+	        const token = String(Date.now()) + ":" + String(Math.random());
+	        try {{ parentWin.__fsSweepZoomQPToken = token; }} catch (e) {{}}
 
         const plotCount = {int(plot_count)};
         const dataId = {json.dumps(str(data_id))};
@@ -891,18 +887,23 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
           else params.set(k, String(v));
         }}
 
-	        function applyParams(idx, xr, yr) {{
-	          try {{
-	            const url = new URL(parentWin.location.href);
-	            const p = url.searchParams;
-	            p.set("zoom_file", dataId);
-	            setParam(p, "z" + idx + "_x0", xr ? xr[0] : null);
-	            setParam(p, "z" + idx + "_x1", xr ? xr[1] : null);
-	            setParam(p, "z" + idx + "_y0", yr ? yr[0] : null);
-	            setParam(p, "z" + idx + "_y1", yr ? yr[1] : null);
-	            parentWin.history.replaceState({{}}, "", url.toString());
-	          }} catch (e) {{}}
-	        }}
+		        function applyParams(idx, xr, yr) {{
+		          try {{
+		            const url = new URL(parentWin.location.href);
+		            const p = url.searchParams;
+		            p.set("zoom_file", dataId);
+		            // Only touch an axis if this event included it (prevents clearing X when only Y changes, etc).
+		            if (xr !== undefined) {{
+		              setParam(p, "z" + idx + "_x0", xr ? xr[0] : null);
+		              setParam(p, "z" + idx + "_x1", xr ? xr[1] : null);
+		            }}
+		            if (yr !== undefined) {{
+		              setParam(p, "z" + idx + "_y0", yr ? yr[0] : null);
+		              setParam(p, "z" + idx + "_y1", yr ? yr[1] : null);
+		            }}
+		            parentWin.history.replaceState({{}}, "", url.toString());
+		          }} catch (e) {{}}
+		        }}
 
 	        function bind(gd, idx) {{
 	          if (!gd || !gd.on) return;
@@ -934,25 +935,43 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
 	          gd.on("plotly_relayout", handler);
 	        }}
 
-	        function getPlots() {{
-	          const out = [];
-	          try {{
-	            // Prefer Streamlit chart blocks for stable ordering.
-	            const direct = parentWin.document?.querySelectorAll?.('div[data-testid="stPlotlyChart"] div.js-plotly-plot') || [];
-	            for (const el of direct) out.push(el);
-	          }} catch (e) {{}}
-	          try {{
-	            const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
-	            for (const fr of iframes) {{
-	              try {{
-	                const doc = fr.contentWindow?.document;
-	                const inner = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"] div.js-plotly-plot') || [];
-	                for (const el of inner) out.push(el);
-	              }} catch (e) {{}}
-	            }}
-	          }} catch (e) {{}}
-	          return out;
-	        }}
+		        function getPlots() {{
+		          const out = [];
+		          try {{
+		            // Prefer Streamlit chart blocks for stable ordering.
+		            const direct = parentWin.document?.querySelectorAll?.('div[data-testid="stPlotlyChart"] div.js-plotly-plot') || [];
+		            for (const el of direct) out.push(el);
+		          }} catch (e) {{}}
+		          try {{
+		            if (!out.length) {{
+		              const directAny = parentWin.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+		              for (const el of directAny) out.push(el);
+		            }}
+		          }} catch (e) {{}}
+		          try {{
+		            const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
+		            for (const fr of iframes) {{
+		              try {{
+		                const doc = fr.contentWindow?.document;
+		                const inner = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"] div.js-plotly-plot') || [];
+		                for (const el of inner) out.push(el);
+		              }} catch (e) {{}}
+		            }}
+		          }} catch (e) {{}}
+		          try {{
+		            if (!out.length) {{
+		              const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
+		              for (const fr of iframes) {{
+		                try {{
+		                  const doc = fr.contentWindow?.document;
+		                  const innerAny = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
+		                  for (const el of innerAny) out.push(el);
+		                }} catch (e) {{}}
+		              }}
+		            }}
+		          }} catch (e) {{}}
+		          return out;
+		        }}
 
         function syncOnce() {{
           try {{
@@ -964,14 +983,17 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
 	          }} catch (e) {{}}
 	        }}
 
-        function kick() {{
-          let tries = 0;
-          (function tick() {{
-            syncOnce();
-            tries += 1;
-            if (tries < 30) parentWin.setTimeout(tick, 100);
-          }})();
-        }}
+	        function kick() {{
+	          let tries = 0;
+	          (function tick() {{
+	            try {{
+	              if (parentWin.__fsSweepZoomQPToken !== token) return;
+	            }} catch (e) {{}}
+	            syncOnce();
+	            tries += 1;
+	            if (tries < 30) parentWin.setTimeout(tick, 100);
+	          }})();
+	        }}
 
         try {{
           parentWin.__fsSweepZoomQPKick = kick;
