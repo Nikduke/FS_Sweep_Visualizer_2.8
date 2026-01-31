@@ -818,6 +818,125 @@ def _render_client_png_download(
     components.html(html, height=70)
 
 
+def _bind_zoom_persistence_localstorage(data_id: str, plot_count: int = 3) -> None:
+    # Streamlit widget changes can remount Plotly charts; `uirevision` alone may not persist zoom in that case.
+    # This keeps zoom state in the browser (localStorage) and reapplies it after reruns.
+    rev_key = f"__zoom_ls_rev:{data_id}"
+    st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
+    bind_rev = int(st.session_state[rev_key])
+
+    html = f"""
+    <div style="display:none"></div>
+    <script>
+      (function () {{
+        const parentWin = window.parent || window;
+        const token = String(Date.now()) + ":" + String(Math.random());
+        try {{ parentWin.__fsSweepZoomLSToken = token; }} catch (e) {{}}
+
+        const plotCount = {int(plot_count)};
+        const dataId = {json.dumps(str(data_id))};
+        const keyPrefix = "fs_sweep_zoom:" + dataId + ":";
+
+        function parseJson(s) {{ try {{ return JSON.parse(s); }} catch (e) {{ return null; }} }}
+        function load(idx) {{
+          try {{
+            const raw = parentWin.localStorage?.getItem?.(keyPrefix + String(idx));
+            return raw ? parseJson(raw) : null;
+          }} catch (e) {{ return null; }}
+        }}
+        function save(idx, obj) {{
+          try {{
+            if (!obj) parentWin.localStorage?.removeItem?.(keyPrefix + String(idx));
+            else parentWin.localStorage?.setItem?.(keyPrefix + String(idx), JSON.stringify(obj));
+          }} catch (e) {{}}
+        }}
+
+        function getPlotsFromDoc(doc) {{
+          const out = [];
+          try {{
+            const blocks = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"]') || [];
+            for (const b of blocks) {{
+              const el = b.querySelector?.("div.js-plotly-plot");
+              if (el) out.push(el);
+            }}
+          }} catch (e) {{}}
+          if (out.length) return out;
+          try {{
+            const els = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
+            for (const el of els) out.push(el);
+          }} catch (e) {{}}
+          return out;
+        }}
+
+        function getPlots() {{
+          const out = [];
+          try {{ for (const el of getPlotsFromDoc(parentWin.document)) out.push(el); }} catch (e) {{}}
+          try {{
+            const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
+            for (const fr of iframes) {{
+              try {{ for (const el of getPlotsFromDoc(fr.contentWindow?.document)) out.push(el); }} catch (e) {{}}
+            }}
+          }} catch (e) {{}}
+          return out;
+        }}
+
+        function applySaved(gd, idx) {{
+          if (!gd || !parentWin.Plotly) return;
+          const st = load(idx);
+          if (!st) return;
+          const update = {{}};
+          if (st.x === null) update["xaxis.autorange"] = true;
+          else if (Array.isArray(st.x) && st.x.length === 2) update["xaxis.range"] = [st.x[0], st.x[1]];
+          if (st.y === null) update["yaxis.autorange"] = true;
+          else if (Array.isArray(st.y) && st.y.length === 2) update["yaxis.range"] = [st.y[0], st.y[1]];
+          try {{ if (Object.keys(update).length) parentWin.Plotly.relayout(gd, update); }} catch (e) {{}}
+        }}
+
+        function bind(gd, idx) {{
+          if (!gd || !gd.on) return;
+          try {{
+            if (gd.__fsZoomLSHandler && gd.removeListener) gd.removeListener("plotly_relayout", gd.__fsZoomLSHandler);
+          }} catch (e) {{}}
+
+          // Re-apply after rerender/remount.
+          applySaved(gd, idx);
+
+          const handler = function (evt) {{
+            if (!evt || typeof evt !== "object") return;
+            const st = load(idx) || {{}};
+
+            if (evt["xaxis.autorange"] === true) st.x = null;
+            else if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) st.x = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
+
+            if (evt["yaxis.autorange"] === true) st.y = null;
+            else if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) st.y = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
+
+            // Clear entry when user resets both axes.
+            if (st.x === null && st.y === null) save(idx, null);
+            else save(idx, st);
+          }};
+
+          try {{ gd.__fsZoomLSHandler = handler; }} catch (e) {{}}
+          gd.on("plotly_relayout", handler);
+        }}
+
+        (function kick() {{
+          let tries = 0;
+          (function tick() {{
+            try {{ if (parentWin.__fsSweepZoomLSToken !== token) return; }} catch (e) {{}}
+            const plots = getPlots();
+            const n = Math.min(plotCount, plots.length);
+            for (let i = 0; i < n; i++) bind(plots[i], i);
+            tries += 1;
+            if (tries < 30) parentWin.setTimeout(tick, 100);
+          }})();
+        }})();
+      }})();
+    </script>
+    """
+    components.html(html, height=0, key=f"zoom_ls:{data_id}:{bind_rev}")
+
+
 def main():
     st.title("FS Sweep Visualizer (Spline)")
 
@@ -1039,6 +1158,8 @@ def main():
     st.plotly_chart(fig_r, use_container_width=bool(use_auto_width), config=download_config, key="plot_r")
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
+
+    _bind_zoom_persistence_localstorage(data_id=data_id, plot_count=3)
 
 
 if __name__ == "__main__":
