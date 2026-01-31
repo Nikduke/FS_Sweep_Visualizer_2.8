@@ -872,14 +872,10 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
     <script>
       (function () {{
         const parentWin = window.parent || window;
-        const installTag = "fs_sweep_stuck1_zoom_qp_v1";
-        try {{
-          if (parentWin.__fsSweepStuck1ZoomInstalled === installTag && typeof parentWin.__fsSweepStuck1ZoomKick === "function") {{
-            parentWin.__fsSweepStuck1ZoomKick();
-            return;
-          }}
-          parentWin.__fsSweepStuck1ZoomInstalled = installTag;
-        }} catch (e) {{}}
+        // Always (re)install: Streamlit can keep old JS alive; a global "installed" flag can freeze old dataId/handlers.
+        // Use a per-run token so only the latest injected script stays active.
+        const token = String(Date.now()) + ":" + String(Math.random());
+        try {{ parentWin.__fsSweepStuck1ZoomToken = token; }} catch (e) {{}}
 
         const plotCount = {int(plot_count)};
         const dataId = {json.dumps(str(data_id))};
@@ -973,6 +969,9 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
         function kick() {{
           let tries = 0;
           (function tick() {{
+            try {{
+              if (parentWin.__fsSweepStuck1ZoomToken !== token) return;
+            }} catch (e) {{}}
             syncOnce();
             tries += 1;
             if (tries < 30) parentWin.setTimeout(tick, 100);
