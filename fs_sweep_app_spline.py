@@ -861,6 +861,12 @@ def _apply_zoom_from_query_params(fig: go.Figure, plot_index: int, data_id: str)
 def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
     # Minimal + reliable: capture Plotly relayout and store axis ranges in URL query params.
     # This avoids "stuck first zoom" by removing the previous handler and rebinding on reruns.
+    #
+    # IMPORTANT: Streamlit may keep the HTML component iframe alive and not re-execute identical JS on reruns.
+    # We force a fresh iframe by changing the component `key` every rerun.
+    rev_key = f"__zoom_bind_rev:{data_id}"
+    st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
+    bind_rev = int(st.session_state[rev_key])
     html = f"""
     <div style="display:none"></div>
     <script>
@@ -900,19 +906,36 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
           }} catch (e) {{}}
         }}
 
+        function getPlotsFromDoc(doc) {{
+          const out = [];
+          try {{
+            const blocks = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"]') || [];
+            for (const b of blocks) {{
+              const el = b.querySelector?.("div.js-plotly-plot");
+              if (el) out.push(el);
+            }}
+          }} catch (e) {{}}
+
+          if (out.length) return out;
+
+          // Fallback for older/newer Streamlit DOM structures.
+          try {{
+            const els = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
+            for (const el of els) out.push(el);
+          }} catch (e) {{}}
+          return out;
+        }}
+
         function getPlots() {{
           const out = [];
           try {{
-            const direct = parentWin.document?.querySelectorAll?.("div.stPlotlyChart div.js-plotly-plot") || [];
-            for (const el of direct) out.push(el);
+            for (const el of getPlotsFromDoc(parentWin.document)) out.push(el);
           }} catch (e) {{}}
           try {{
             const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
             for (const fr of iframes) {{
               try {{
-                const doc = fr.contentWindow?.document;
-                const inner = doc?.querySelectorAll?.("div.stPlotlyChart div.js-plotly-plot") || [];
-                for (const el of inner) out.push(el);
+                for (const el of getPlotsFromDoc(fr.contentWindow?.document)) out.push(el);
               }} catch (e) {{}}
             }}
           }} catch (e) {{}}
@@ -961,7 +984,7 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
       }})();
     </script>
     """
-    components.html(html, height=0)
+    components.html(html, height=0, key=f"zoom_bind:{data_id}:{bind_rev}")
 
 
 
