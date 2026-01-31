@@ -1,10 +1,7 @@
-/* Minimal Streamlit component (no build tooling) that captures Plotly `plotly_relayout`
- * events from the parent document and sends ranges to Python via `streamlit:setComponentValue`.
- */
-
-function isStreamlitMessage(eventData) {
-  return Boolean(eventData && eventData.isStreamlitMessage);
-}
+// Minimal Streamlit component (no build tooling), using Streamlit's postMessage protocol:
+// - Binds to Plotly charts rendered by Streamlit (`stPlotlyChart` blocks)
+// - Captures Plotly `plotly_relayout` events
+// - Sends ranges to Python via `streamlit:setComponentValue`
 
 function sendToStreamlit(type, payload) {
   try {
@@ -12,7 +9,7 @@ function sendToStreamlit(type, payload) {
       {
         isStreamlitMessage: true,
         type,
-        ...payload,
+        ...(payload || {}),
       },
       "*",
     );
@@ -32,12 +29,6 @@ function scheduleSend(value) {
   pending = value;
   const t = nowMs();
   const dueIn = Math.max(0, debounceMs - (t - lastSentAt));
-  if (dueIn === 0) {
-    lastSentAt = t;
-    sendToStreamlit("streamlit:setComponentValue", { value: pending });
-    pending = null;
-    return;
-  }
   setTimeout(() => {
     if (!pending) return;
     lastSentAt = nowMs();
@@ -46,41 +37,33 @@ function scheduleSend(value) {
   }, dueIn);
 }
 
-function getPlotsFromDoc(doc) {
+function getStreamlitPlotDivsFromDoc(doc) {
   const out = [];
   try {
-    // Prefer Streamlit plot containers for stable ordering.
-    const blocks =
-      doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"], div.stPlotlyChart') || [];
-    for (const b of blocks) {
-      const el = b.querySelector?.("div.js-plotly-plot");
-      if (el) out.push(el);
-    }
-  } catch (e) {}
-
-  if (out.length) return out;
-
-  // Do NOT fall back to "all plotly divs". Streamlit apps often embed other Plotly
-  // instances (e.g. offscreen export plots) inside component iframes; binding to those
-  // breaks the plot index mapping and makes zoom appear to "not save".
-  return [];
-}
-
-function getAllPlots(parentWin) {
-  const out = [];
-  try {
-    for (const el of getPlotsFromDoc(parentWin.document)) out.push(el);
-  } catch (e) {}
-  try {
-    const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
-    for (const fr of iframes) {
-      try {
-        const doc = fr.contentWindow?.document;
-        for (const el of getPlotsFromDoc(doc)) out.push(el);
-      } catch (e) {}
+    const blocks = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"], div.stPlotlyChart') || [];
+    for (const block of blocks) {
+      // Prefer Plotly inside chart iframe if present.
+      const fr = block.querySelector?.("iframe");
+      if (fr && fr.contentWindow && fr.contentWindow.document) {
+        const gd = fr.contentWindow.document.querySelector?.("div.js-plotly-plot");
+        if (gd) {
+          out.push(gd);
+          continue;
+        }
+      }
+      // Fallback: Plotly directly in the block.
+      const gd2 = block.querySelector?.("div.js-plotly-plot");
+      if (gd2) out.push(gd2);
     }
   } catch (e) {}
   return out;
+}
+
+function getPlotDivs() {
+  // Only bind to Streamlit plotly charts. Do NOT bind to other Plotly instances
+  // (e.g., offscreen exporter plots created in component iframes).
+  const parentDoc = (window.parent || window).document;
+  return getStreamlitPlotDivsFromDoc(parentDoc);
 }
 
 function bindOne(gd, idx, dataId) {
@@ -94,10 +77,7 @@ function bindOne(gd, idx, dataId) {
   const handler = (evt) => {
     try {
       if (!evt || typeof evt !== "object") return;
-      const payload = {
-        data_id: String(dataId),
-        plot_index: idx,
-      };
+      const payload = { data_id: String(dataId), plot_index: idx };
 
       if (evt["xaxis.autorange"] === true) payload.xautorange = true;
       if (evt["yaxis.autorange"] === true) payload.yautorange = true;
@@ -111,7 +91,7 @@ function bindOne(gd, idx, dataId) {
         payload.y1 = evt["yaxis.range[1]"];
       }
 
-      // Ignore events that don't carry any axis info.
+      // Ignore events that don't carry axis info.
       if (
         payload.x0 === undefined &&
         payload.xautorange !== true &&
@@ -133,11 +113,9 @@ function bindOne(gd, idx, dataId) {
 
 function syncBindings() {
   if (!latestArgs) return;
-  const parentWin = window.parent || window;
   const plotCount = Number(latestArgs.plot_count || 3);
   const dataId = String(latestArgs.data_id || "");
-
-  const plots = getAllPlots(parentWin);
+  const plots = getPlotDivs();
   const n = Math.min(plotCount, plots.length);
   for (let i = 0; i < n; i++) bindOne(plots[i], i, dataId);
 }
@@ -152,15 +130,16 @@ function kickRebindLoop() {
 }
 
 window.addEventListener("message", (event) => {
-  if (!isStreamlitMessage(event.data)) return;
-  if (event.data.type === "streamlit:render") {
-    latestArgs = event.data.args || {};
-    debounceMs = Number(latestArgs.debounce_ms || 120);
-    try {
-      sendToStreamlit("streamlit:setFrameHeight", { height: 0 });
-    } catch (e) {}
-    kickRebindLoop();
-  }
+  // Incoming Streamlit messages may or may not include an `isStreamlitMessage` flag.
+  // Match by `type` to avoid dropping the render message (which would prevent any binding).
+  const data = event && event.data ? event.data : null;
+  if (!data || data.type !== "streamlit:render") return;
+  latestArgs = data.args || {};
+  debounceMs = Number(latestArgs.debounce_ms || 120);
+  try {
+    sendToStreamlit("streamlit:setFrameHeight", { height: 0 });
+  } catch (e) {}
+  kickRebindLoop();
 });
 
 sendToStreamlit("streamlit:componentReady", { apiVersion: 1 });
