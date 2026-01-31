@@ -859,19 +859,20 @@ def _apply_zoom_from_query_params(fig: go.Figure, plot_index: int, data_id: str)
 
 
 def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
-    # Keep this minimal and self-contained: write zoom ranges into the URL query string on every relayout.
+    # Minimal + reliable: capture Plotly relayout and store axis ranges in URL query params.
+    # This avoids "stuck first zoom" by removing the previous handler and rebinding on reruns.
     html = f"""
     <div style="display:none"></div>
     <script>
       (function () {{
         const parentWin = window.parent || window;
-        const installTag = "fs_sweep_stuck_zoom_qp_v1";
+        const installTag = "fs_sweep_stuck1_zoom_qp_v1";
         try {{
-          if (parentWin.__fsSweepStuckZoomInstalled === installTag && typeof parentWin.__fsSweepStuckZoomKick === "function") {{
-            parentWin.__fsSweepStuckZoomKick();
+          if (parentWin.__fsSweepStuck1ZoomInstalled === installTag && typeof parentWin.__fsSweepStuck1ZoomKick === "function") {{
+            parentWin.__fsSweepStuck1ZoomKick();
             return;
           }}
-          parentWin.__fsSweepStuckZoomInstalled = installTag;
+          parentWin.__fsSweepStuck1ZoomInstalled = installTag;
         }} catch (e) {{}}
 
         const plotCount = {int(plot_count)};
@@ -887,10 +888,14 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
             const url = new URL(parentWin.location.href);
             const p = url.searchParams;
             p.set("zoom_file", dataId);
-            setParam(p, "z" + idx + "_x0", xr ? xr[0] : null);
-            setParam(p, "z" + idx + "_x1", xr ? xr[1] : null);
-            setParam(p, "z" + idx + "_y0", yr ? yr[0] : null);
-            setParam(p, "z" + idx + "_y1", yr ? yr[1] : null);
+            if (xr !== undefined) {{
+              setParam(p, "z" + idx + "_x0", xr ? xr[0] : null);
+              setParam(p, "z" + idx + "_x1", xr ? xr[1] : null);
+            }}
+            if (yr !== undefined) {{
+              setParam(p, "z" + idx + "_y0", yr ? yr[0] : null);
+              setParam(p, "z" + idx + "_y1", yr ? yr[1] : null);
+            }}
             parentWin.history.replaceState({{}}, "", url.toString());
           }} catch (e) {{}}
         }}
@@ -898,7 +903,7 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
         function getPlots() {{
           const out = [];
           try {{
-            const direct = parentWin.document?.querySelectorAll?.("div.js-plotly-plot") || [];
+            const direct = parentWin.document?.querySelectorAll?.("div.stPlotlyChart div.js-plotly-plot") || [];
             for (const el of direct) out.push(el);
           }} catch (e) {{}}
           try {{
@@ -906,7 +911,7 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
             for (const fr of iframes) {{
               try {{
                 const doc = fr.contentWindow?.document;
-                const inner = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
+                const inner = doc?.querySelectorAll?.("div.stPlotlyChart div.js-plotly-plot") || [];
                 for (const el of inner) out.push(el);
               }} catch (e) {{}}
             }}
@@ -917,22 +922,22 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
         function bind(gd, idx) {{
           if (!gd || !gd.on) return;
           try {{
-            if (gd.__fsStuckZoomHandler && gd.removeListener) {{
-              gd.removeListener("plotly_relayout", gd.__fsStuckZoomHandler);
+            if (gd.__fsStuck1ZoomHandler && gd.removeListener) {{
+              gd.removeListener("plotly_relayout", gd.__fsStuck1ZoomHandler);
             }}
           }} catch (e) {{}}
 
           const handler = function (evt) {{
             if (!evt || typeof evt !== "object") return;
-            let xr = null, yr = null;
-            if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) xr = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
-            if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) yr = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
+            let xr = undefined, yr = undefined;
             if (evt["xaxis.autorange"] === true) xr = null;
+            else if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) xr = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
             if (evt["yaxis.autorange"] === true) yr = null;
+            else if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) yr = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
             writeParams(idx, xr, yr);
           }};
 
-          gd.__fsStuckZoomHandler = handler;
+          gd.__fsStuck1ZoomHandler = handler;
           gd.on("plotly_relayout", handler);
         }}
 
@@ -951,7 +956,7 @@ def _bind_zoom_to_query_params(data_id: str, plot_count: int = 3) -> None:
           }})();
         }}
 
-        try {{ parentWin.__fsSweepStuckZoomKick = kick; }} catch (e) {{}}
+        try {{ parentWin.__fsSweepStuck1ZoomKick = kick; }} catch (e) {{}}
         kick();
       }})();
     </script>
@@ -1139,8 +1144,9 @@ def main():
         if harm_shapes:
             fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
 
-    # Restore last zoom from query params (overrides uirevision behavior when Streamlit remounts charts).
-    # Plot indices must match the on-page plot order below: X(0), R(1), X/R(2).
+    # No forced x-range in this variant (preserves zoom via uirevision).
+
+    # Restore last zoom from query params (works even when Streamlit remounts charts).
     _apply_zoom_from_query_params(fig_x, plot_index=0, data_id=data_id)
     _apply_zoom_from_query_params(fig_r, plot_index=1, data_id=data_id)
     _apply_zoom_from_query_params(fig_xr, plot_index=2, data_id=data_id)
@@ -1189,7 +1195,7 @@ def main():
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
 
-    # Save zoom/pan in URL params on every relayout so the next rerun can restore it.
+    # Persist zoom/pan: update URL params on every relayout so the next rerun restores correctly.
     _bind_zoom_to_query_params(data_id=data_id, plot_count=3)
 
 
