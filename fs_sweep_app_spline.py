@@ -818,9 +818,11 @@ def _render_client_png_download(
     components.html(html, height=70)
 
 
-def _bind_zoom_persistence_localstorage(data_id: str, plot_count: int = 3) -> None:
+def _bind_zoom_persistence_browser_state(data_id: str, plot_count: int = 3) -> None:
     # Streamlit widget changes can remount Plotly charts; `uirevision` alone may not persist zoom in that case.
-    # This keeps zoom state in the browser (localStorage) and reapplies it after reruns.
+    #
+    # IMPORTANT: `components.html` runs in a sandboxed iframe; browser storage APIs can be blocked there.
+    # Use an in-memory store on the *main app window* (window.parent) and reapply via the plot iframe's Plotly.
     rev_key = f"__zoom_ls_rev:{data_id}"
     st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
     bind_rev = int(st.session_state[rev_key])
@@ -835,19 +837,22 @@ def _bind_zoom_persistence_localstorage(data_id: str, plot_count: int = 3) -> No
 
         const plotCount = {int(plot_count)};
         const dataId = {json.dumps(str(data_id))};
-        const keyPrefix = "fs_sweep_zoom:" + dataId + ":";
+        try {{
+          if (!parentWin.__fsSweepZoomState) parentWin.__fsSweepZoomState = {{}};
+          if (!parentWin.__fsSweepZoomState[dataId]) parentWin.__fsSweepZoomState[dataId] = {{}};
+        }} catch (e) {{}}
 
-        function parseJson(s) {{ try {{ return JSON.parse(s); }} catch (e) {{ return null; }} }}
         function load(idx) {{
           try {{
-            const raw = parentWin.localStorage?.getItem?.(keyPrefix + String(idx));
-            return raw ? parseJson(raw) : null;
+            return parentWin.__fsSweepZoomState?.[dataId]?.[String(idx)] || null;
           }} catch (e) {{ return null; }}
         }}
+
         function save(idx, obj) {{
           try {{
-            if (!obj) parentWin.localStorage?.removeItem?.(keyPrefix + String(idx));
-            else parentWin.localStorage?.setItem?.(keyPrefix + String(idx), JSON.stringify(obj));
+            const k = String(idx);
+            if (!obj) delete parentWin.__fsSweepZoomState?.[dataId]?.[k];
+            else parentWin.__fsSweepZoomState[dataId][k] = obj;
           }} catch (e) {{}}
         }}
 
@@ -881,7 +886,10 @@ def _bind_zoom_persistence_localstorage(data_id: str, plot_count: int = 3) -> No
         }}
 
         function applySaved(gd, idx) {{
-          if (!gd || !parentWin.Plotly) return;
+          if (!gd) return;
+          const plotWin = gd.ownerDocument?.defaultView;
+          const Plotly = plotWin?.Plotly;
+          if (!Plotly) return;
           const st = load(idx);
           if (!st) return;
           const update = {{}};
@@ -889,7 +897,7 @@ def _bind_zoom_persistence_localstorage(data_id: str, plot_count: int = 3) -> No
           else if (Array.isArray(st.x) && st.x.length === 2) update["xaxis.range"] = [st.x[0], st.x[1]];
           if (st.y === null) update["yaxis.autorange"] = true;
           else if (Array.isArray(st.y) && st.y.length === 2) update["yaxis.range"] = [st.y[0], st.y[1]];
-          try {{ if (Object.keys(update).length) parentWin.Plotly.relayout(gd, update); }} catch (e) {{}}
+          try {{ if (Object.keys(update).length) Plotly.relayout(gd, update); }} catch (e) {{}}
         }}
 
         function bind(gd, idx) {{
@@ -1159,7 +1167,7 @@ def main():
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
 
-    _bind_zoom_persistence_localstorage(data_id=data_id, plot_count=3)
+    _bind_zoom_persistence_browser_state(data_id=data_id, plot_count=3)
 
 
 if __name__ == "__main__":
