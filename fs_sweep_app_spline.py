@@ -2,7 +2,6 @@ import os
 import hashlib
 import json
 from typing import Dict, List, Tuple, Optional
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -818,131 +817,81 @@ def _render_client_png_download(
     components.html(html, height=70)
 
 
-def _bind_zoom_persistence_browser_state(data_id: str, plot_count: int = 3) -> None:
-    # Streamlit widget changes can remount Plotly charts; `uirevision` alone may not persist zoom in that case.
-    #
-    # IMPORTANT: `components.html` runs in a sandboxed iframe; browser storage APIs can be blocked there.
-    # Use an in-memory store on the *main app window* (window.parent) and reapply via the plot iframe's Plotly.
-    rev_key = f"__zoom_ls_rev:{data_id}"
-    st.session_state[rev_key] = int(st.session_state.get(rev_key, 0)) + 1
-    bind_rev = int(st.session_state[rev_key])
+_plotly_relayout_listener = components.declare_component(
+    "plotly_relayout_listener",
+    path=str(os.path.join(os.path.dirname(__file__), "plotly_relayout_listener")),
+)
 
-    html = f"""
-    <div style="display:none"></div>
-    <script>
-      (function () {{
-        const parentWin = window.parent || window;
-        const token = String(Date.now()) + ":" + String(Math.random());
-        try {{ parentWin.__fsSweepZoomLSToken = token; }} catch (e) {{}}
 
-        const plotCount = {int(plot_count)};
-        const dataId = {json.dumps(str(data_id))};
-        try {{
-          if (!parentWin.__fsSweepZoomState) parentWin.__fsSweepZoomState = {{}};
-          if (!parentWin.__fsSweepZoomState[dataId]) parentWin.__fsSweepZoomState[dataId] = {{}};
-        }} catch (e) {{}}
+def plotly_relayout_listener(data_id: str, plot_count: int = 3, debounce_ms: int = 120) -> Optional[Dict[str, object]]:
+    # Returns the most recent relayout payload sent from the browser, or None.
+    return _plotly_relayout_listener(  # type: ignore[misc]
+        data_id=str(data_id),
+        plot_count=int(plot_count),
+        debounce_ms=int(debounce_ms),
+        key=f"plotly_relayout_listener:{data_id}",
+        default=None,
+    )
 
-        function load(idx) {{
-          try {{
-            return parentWin.__fsSweepZoomState?.[dataId]?.[String(idx)] || null;
-          }} catch (e) {{ return null; }}
-        }}
 
-        function save(idx, obj) {{
-          try {{
-            const k = String(idx);
-            if (!obj) delete parentWin.__fsSweepZoomState?.[dataId]?.[k];
-            else parentWin.__fsSweepZoomState[dataId][k] = obj;
-          }} catch (e) {{}}
-        }}
+def _update_zoom_state_from_relayout(evt: Optional[Dict[str, object]], data_id: str) -> None:
+    if not evt:
+        return
+    if str(evt.get("data_id", "")) != str(data_id):
+        return
 
-        function getPlotsFromDoc(doc) {{
-          const out = [];
-          try {{
-            const blocks = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"]') || [];
-            for (const b of blocks) {{
-              const el = b.querySelector?.("div.js-plotly-plot");
-              if (el) out.push(el);
-            }}
-          }} catch (e) {{}}
-          if (out.length) return out;
-          try {{
-            const els = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
-            for (const el of els) out.push(el);
-          }} catch (e) {{}}
-          return out;
-        }}
+    try:
+        plot_index = int(evt.get("plot_index"))  # type: ignore[arg-type]
+    except Exception:
+        return
 
-        function getPlots() {{
-          const out = [];
-          try {{ for (const el of getPlotsFromDoc(parentWin.document)) out.push(el); }} catch (e) {{}}
-          try {{
-            const iframes = parentWin.document?.querySelectorAll?.("iframe") || [];
-            for (const fr of iframes) {{
-              try {{ for (const el of getPlotsFromDoc(fr.contentWindow?.document)) out.push(el); }} catch (e) {{}}
-            }}
-          }} catch (e) {{}}
-          return out;
-        }}
+    store_key = f"zoom_ranges:{data_id}"
+    store = st.session_state.get(store_key)
+    if not isinstance(store, dict):
+        store = {}
 
-        function applySaved(gd, idx) {{
-          if (!gd) return;
-          const plotWin = gd.ownerDocument?.defaultView;
-          const Plotly = plotWin?.Plotly;
-          if (!Plotly) return;
-          const st = load(idx);
-          if (!st) return;
-          const update = {{}};
-          if (st.x === null) update["xaxis.autorange"] = true;
-          else if (Array.isArray(st.x) && st.x.length === 2) update["xaxis.range"] = [st.x[0], st.x[1]];
-          if (st.y === null) update["yaxis.autorange"] = true;
-          else if (Array.isArray(st.y) && st.y.length === 2) update["yaxis.range"] = [st.y[0], st.y[1]];
-          try {{ if (Object.keys(update).length) Plotly.relayout(gd, update); }} catch (e) {{}}
-        }}
+    entry = store.get(plot_index)
+    if not isinstance(entry, dict):
+        entry = {}
 
-        function bind(gd, idx) {{
-          if (!gd || !gd.on) return;
-          try {{
-            if (gd.__fsZoomLSHandler && gd.removeListener) gd.removeListener("plotly_relayout", gd.__fsZoomLSHandler);
-          }} catch (e) {{}}
+    if evt.get("xautorange") is True:
+        entry.pop("x", None)
+    else:
+        if "x0" in evt and "x1" in evt:
+            try:
+                entry["x"] = [float(evt["x0"]), float(evt["x1"])]  # type: ignore[arg-type]
+            except Exception:
+                pass
 
-          // Re-apply after rerender/remount.
-          applySaved(gd, idx);
+    if evt.get("yautorange") is True:
+        entry.pop("y", None)
+    else:
+        if "y0" in evt and "y1" in evt:
+            try:
+                entry["y"] = [float(evt["y0"]), float(evt["y1"])]  # type: ignore[arg-type]
+            except Exception:
+                pass
 
-          const handler = function (evt) {{
-            if (!evt || typeof evt !== "object") return;
-            const st = load(idx) || {{}};
+    store[plot_index] = entry
+    st.session_state[store_key] = store
 
-            if (evt["xaxis.autorange"] === true) st.x = null;
-            else if (evt["xaxis.range[0]"] != null && evt["xaxis.range[1]"] != null) st.x = [evt["xaxis.range[0]"], evt["xaxis.range[1]"]];
 
-            if (evt["yaxis.autorange"] === true) st.y = null;
-            else if (evt["yaxis.range[0]"] != null && evt["yaxis.range[1]"] != null) st.y = [evt["yaxis.range[0]"], evt["yaxis.range[1]"]];
+def _apply_saved_zoom(fig: go.Figure, plot_index: int, data_id: str) -> None:
+    store = st.session_state.get(f"zoom_ranges:{data_id}")
+    if not isinstance(store, dict):
+        return
+    entry = store.get(int(plot_index))
+    if not isinstance(entry, dict):
+        return
 
-            // Clear entry when user resets both axes.
-            if (st.x === null && st.y === null) save(idx, null);
-            else save(idx, st);
-          }};
+    xr = entry.get("x")
+    yr = entry.get("y")
+    if isinstance(xr, list) and len(xr) == 2:
+        fig.update_xaxes(range=[float(xr[0]), float(xr[1])], autorange=False)
+    if isinstance(yr, list) and len(yr) == 2:
+        fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False)
 
-          try {{ gd.__fsZoomLSHandler = handler; }} catch (e) {{}}
-          gd.on("plotly_relayout", handler);
-        }}
 
-        (function kick() {{
-          let tries = 0;
-          (function tick() {{
-            try {{ if (parentWin.__fsSweepZoomLSToken !== token) return; }} catch (e) {{}}
-            const plots = getPlots();
-            const n = Math.min(plotCount, plots.length);
-            for (let i = 0; i < n; i++) bind(plots[i], i);
-            tries += 1;
-            if (tries < 30) parentWin.setTimeout(tick, 100);
-          }})();
-        }})();
-      }})();
-    </script>
-    """
-    components.html(html, height=0, key=f"zoom_ls:{data_id}:{bind_rev}")
 
 
 def main():
@@ -1120,8 +1069,16 @@ def main():
     n_lo, n_hi = compute_common_n_range(f_refs, f_base)
     harm_shapes = build_harmonic_shapes(n_lo, n_hi, f_base, show_harmonics, bin_width_hz)
     for fig in (fig_r, fig_x, fig_xr):
+        fig.update_xaxes(range=[n_lo, n_hi])
         if harm_shapes:
             fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
+
+    # Capture and persist user zoom/pan (relayout) events in session_state, then reapply them.
+    relayout_evt = plotly_relayout_listener(data_id=data_id, plot_count=3, debounce_ms=150)
+    _update_zoom_state_from_relayout(relayout_evt, data_id=data_id)
+    _apply_saved_zoom(fig_x, plot_index=0, data_id=data_id)
+    _apply_saved_zoom(fig_r, plot_index=1, data_id=data_id)
+    _apply_saved_zoom(fig_xr, plot_index=2, data_id=data_id)
 
     # Render
     st.subheader(f"Sequence: {seq_label} | Base: {int(f_base)} Hz")
@@ -1166,8 +1123,6 @@ def main():
     st.plotly_chart(fig_r, use_container_width=bool(use_auto_width), config=download_config, key="plot_r")
     st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
     st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
-
-    _bind_zoom_persistence_browser_state(data_id=data_id, plot_count=3)
 
 
 if __name__ == "__main__":
