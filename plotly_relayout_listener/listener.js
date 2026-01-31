@@ -50,7 +50,8 @@ function getPlotsFromDoc(doc) {
   const out = [];
   try {
     // Prefer Streamlit plot containers for stable ordering.
-    const blocks = doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"]') || [];
+    const blocks =
+      doc?.querySelectorAll?.('div[data-testid="stPlotlyChart"], div.stPlotlyChart') || [];
     for (const b of blocks) {
       const el = b.querySelector?.("div.js-plotly-plot");
       if (el) out.push(el);
@@ -59,11 +60,10 @@ function getPlotsFromDoc(doc) {
 
   if (out.length) return out;
 
-  try {
-    const els = doc?.querySelectorAll?.("div.js-plotly-plot") || [];
-    for (const el of els) out.push(el);
-  } catch (e) {}
-  return out;
+  // Do NOT fall back to "all plotly divs". Streamlit apps often embed other Plotly
+  // instances (e.g. offscreen export plots) inside component iframes; binding to those
+  // breaks the plot index mapping and makes zoom appear to "not save".
+  return [];
 }
 
 function getAllPlots(parentWin) {
