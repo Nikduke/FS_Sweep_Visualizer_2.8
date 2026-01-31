@@ -20,6 +20,8 @@ let latestArgs = null;
 let debounceMs = 120;
 let pending = null;
 let lastSentAt = 0;
+let lastDataId = null;
+let lastSigByPlot = new Map();
 
 function nowMs() {
   return Date.now ? Date.now() : new Date().getTime();
@@ -101,6 +103,28 @@ function bindOne(gd, idx, dataId) {
         return;
       }
 
+      // Avoid sending duplicate payloads for the same plot index. Streamlit remounts Plotly
+      // charts on reruns (e.g. case toggles), and Plotly may emit an initial relayout event
+      // with the current axis ranges. If we resend the same ranges, it causes an extra rerun
+      // and visible flicker.
+      const roundNum = (v) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return v;
+        return Math.round(n * 1e6) / 1e6;
+      };
+      const sigObj = {
+        plot_index: idx,
+        xautorange: payload.xautorange === true,
+        yautorange: payload.yautorange === true,
+        x0: payload.x0 !== undefined ? roundNum(payload.x0) : undefined,
+        x1: payload.x1 !== undefined ? roundNum(payload.x1) : undefined,
+        y0: payload.y0 !== undefined ? roundNum(payload.y0) : undefined,
+        y1: payload.y1 !== undefined ? roundNum(payload.y1) : undefined,
+      };
+      const sig = JSON.stringify(sigObj);
+      if (lastSigByPlot.get(idx) === sig) return;
+      lastSigByPlot.set(idx, sig);
+
       scheduleSend(payload);
     } catch (e) {}
   };
@@ -136,6 +160,13 @@ window.addEventListener("message", (event) => {
   if (!data || data.type !== "streamlit:render") return;
   latestArgs = data.args || {};
   debounceMs = Number(latestArgs.debounce_ms || 120);
+  try {
+    const newDataId = String(latestArgs.data_id || "");
+    if (lastDataId !== newDataId) {
+      lastDataId = newDataId;
+      lastSigByPlot = new Map();
+    }
+  } catch (e) {}
   try {
     sendToStreamlit("streamlit:setFrameHeight", { height: 0 });
   } catch (e) {}
