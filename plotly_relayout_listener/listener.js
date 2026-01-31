@@ -1,7 +1,7 @@
 // Minimal Streamlit component (no build tooling), using Streamlit's postMessage protocol:
 // - Binds to Plotly charts rendered by Streamlit (`stPlotlyChart` blocks)
 // - Captures Plotly `plotly_relayout` events
-// - Sends ranges to Python via `streamlit:setComponentValue`
+// - Persists ranges in browser localStorage (so zoom does not trigger a Streamlit rerun)
 
 function sendToStreamlit(type, payload) {
   try {
@@ -18,25 +18,48 @@ function sendToStreamlit(type, payload) {
 
 let latestArgs = null;
 let debounceMs = 120;
-let pending = null;
-let lastSentAt = 0;
 let lastDataId = null;
-let lastSigByPlot = new Map();
+let saveTimersByKey = new Map();
 
 function nowMs() {
   return Date.now ? Date.now() : new Date().getTime();
 }
 
-function scheduleSend(value) {
-  pending = value;
-  const t = nowMs();
-  const dueIn = Math.max(0, debounceMs - (t - lastSentAt));
-  setTimeout(() => {
-    if (!pending) return;
-    lastSentAt = nowMs();
-    sendToStreamlit("streamlit:setComponentValue", { value: pending });
-    pending = null;
-  }, dueIn);
+function storageKey(dataId, plotIndex) {
+  return `fsSweepZoom:${String(dataId)}:${String(plotIndex)}`;
+}
+
+function safeLocalStorageGet(key) {
+  try {
+    return window.localStorage ? window.localStorage.getItem(key) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function safeLocalStorageSet(key, value) {
+  try {
+    if (!window.localStorage) return;
+    window.localStorage.setItem(key, value);
+  } catch (e) {}
+}
+
+function safeLocalStorageRemove(key) {
+  try {
+    if (!window.localStorage) return;
+    window.localStorage.removeItem(key);
+  } catch (e) {}
+}
+
+function scheduleSave(key, jsonValue) {
+  const t = saveTimersByKey.get(key);
+  if (t) clearTimeout(t);
+  const timer = setTimeout(() => {
+    saveTimersByKey.delete(key);
+    if (jsonValue === null) safeLocalStorageRemove(key);
+    else safeLocalStorageSet(key, jsonValue);
+  }, Math.max(0, Number(debounceMs || 0)));
+  saveTimersByKey.set(key, timer);
 }
 
 function getStreamlitPlotDivsFromDoc(doc) {
@@ -68,6 +91,71 @@ function getPlotDivs() {
   return getStreamlitPlotDivsFromDoc(parentDoc);
 }
 
+function applyStoredZoomIfAny(gd, idx, dataId) {
+  const key = storageKey(dataId, idx);
+
+  try {
+    if (gd.__fsZoomAppliedKey === key) return;
+    gd.__fsZoomAppliedKey = key;
+  } catch (e) {}
+
+  const raw = safeLocalStorageGet(key);
+  if (!raw) return;
+
+  let saved = null;
+  try {
+    saved = JSON.parse(raw);
+  } catch (e) {
+    return;
+  }
+  if (!saved || typeof saved !== "object") return;
+
+  const update = {};
+  if (Array.isArray(saved.x) && saved.x.length === 2) {
+    update["xaxis.range"] = saved.x;
+    update["xaxis.autorange"] = false;
+  }
+  if (Array.isArray(saved.y) && saved.y.length === 2) {
+    update["yaxis.range"] = saved.y;
+    update["yaxis.autorange"] = false;
+  }
+  if (Object.keys(update).length === 0) return;
+
+  const win = gd?.ownerDocument?.defaultView;
+  const Plotly = win && win.Plotly ? win.Plotly : null;
+  if (!Plotly || !Plotly.relayout) return;
+
+  try {
+    gd.__fsApplyingZoom = true;
+  } catch (e) {}
+
+  try {
+    const p = Plotly.relayout(gd, update);
+    if (p && typeof p.then === "function") {
+      p.then(
+        () => {
+          try {
+            gd.__fsApplyingZoom = false;
+          } catch (e) {}
+        },
+        () => {
+          try {
+            gd.__fsApplyingZoom = false;
+          } catch (e) {}
+        },
+      );
+    } else {
+      try {
+        gd.__fsApplyingZoom = false;
+      } catch (e) {}
+    }
+  } catch (e) {
+    try {
+      gd.__fsApplyingZoom = false;
+    } catch (e2) {}
+  }
+}
+
 function bindOne(gd, idx, dataId) {
   if (!gd || !gd.on) return;
   try {
@@ -78,6 +166,7 @@ function bindOne(gd, idx, dataId) {
 
   const handler = (evt) => {
     try {
+      if (gd.__fsApplyingZoom) return;
       if (!evt || typeof evt !== "object") return;
       const payload = { data_id: String(dataId), plot_index: idx };
 
@@ -103,29 +192,29 @@ function bindOne(gd, idx, dataId) {
         return;
       }
 
-      // Avoid sending duplicate payloads for the same plot index. Streamlit remounts Plotly
-      // charts on reruns (e.g. case toggles), and Plotly may emit an initial relayout event
-      // with the current axis ranges. If we resend the same ranges, it causes an extra rerun
-      // and visible flicker.
-      const roundNum = (v) => {
-        const n = Number(v);
-        if (!Number.isFinite(n)) return v;
-        return Math.round(n * 1e6) / 1e6;
-      };
-      const sigObj = {
-        plot_index: idx,
-        xautorange: payload.xautorange === true,
-        yautorange: payload.yautorange === true,
-        x0: payload.x0 !== undefined ? roundNum(payload.x0) : undefined,
-        x1: payload.x1 !== undefined ? roundNum(payload.x1) : undefined,
-        y0: payload.y0 !== undefined ? roundNum(payload.y0) : undefined,
-        y1: payload.y1 !== undefined ? roundNum(payload.y1) : undefined,
-      };
-      const sig = JSON.stringify(sigObj);
-      if (lastSigByPlot.get(idx) === sig) return;
-      lastSigByPlot.set(idx, sig);
+      const key = storageKey(dataId, idx);
+      const existingRaw = safeLocalStorageGet(key);
+      let existing = null;
+      try {
+        existing = existingRaw ? JSON.parse(existingRaw) : null;
+      } catch (e) {
+        existing = null;
+      }
+      if (!existing || typeof existing !== "object") existing = {};
 
-      scheduleSend(payload);
+      const next = { ...existing };
+
+      if (payload.xautorange === true) delete next.x;
+      else if (payload.x0 !== undefined && payload.x1 !== undefined) next.x = [payload.x0, payload.x1];
+
+      if (payload.yautorange === true) delete next.y;
+      else if (payload.y0 !== undefined && payload.y1 !== undefined) next.y = [payload.y0, payload.y1];
+
+      const hasAny = Array.isArray(next.x) || Array.isArray(next.y);
+      const nextRaw = hasAny ? JSON.stringify(next) : null;
+      if (existingRaw === nextRaw) return;
+
+      scheduleSave(key, nextRaw);
     } catch (e) {}
   };
 
@@ -133,6 +222,7 @@ function bindOne(gd, idx, dataId) {
     gd.__fsRelayoutHandler = handler;
   } catch (e) {}
   gd.on("plotly_relayout", handler);
+  applyStoredZoomIfAny(gd, idx, dataId);
 }
 
 function syncBindings() {
@@ -149,7 +239,7 @@ function kickRebindLoop() {
   (function tick() {
     syncBindings();
     tries += 1;
-    if (tries < 30) setTimeout(tick, 100);
+    if (tries < 80) setTimeout(tick, 100);
   })();
 }
 
@@ -164,7 +254,7 @@ window.addEventListener("message", (event) => {
     const newDataId = String(latestArgs.data_id || "");
     if (lastDataId !== newDataId) {
       lastDataId = newDataId;
-      lastSigByPlot = new Map();
+      saveTimersByKey = new Map();
     }
   } catch (e) {}
   try {
