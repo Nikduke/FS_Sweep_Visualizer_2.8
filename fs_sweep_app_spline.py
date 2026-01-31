@@ -62,7 +62,8 @@ def plotly_relayout_listener(
     debounce_ms: int = 120,
     nonce: int = 0,
 ) -> Optional[Dict[str, object]]:
-    # Returns the most recent relayout payload sent from the browser, or None.
+    # Client-side zoom persistence: binds to Plotly charts and stores axis ranges
+    # in browser localStorage. Returns None (no Python roundtrip on zoom).
     return _plotly_relayout_listener(  # type: ignore[misc]
         data_id=str(data_id),
         plot_count=int(plot_count),
@@ -71,66 +72,6 @@ def plotly_relayout_listener(
         key=f"plotly_relayout_listener:{data_id}",
         default=None,
     )
-
-
-def _update_zoom_state_from_relayout(evt: Optional[Dict[str, object]], data_id: str) -> None:
-    if not evt:
-        return
-    if str(evt.get("data_id", "")) != str(data_id):
-        return
-
-    try:
-        plot_index = int(evt.get("plot_index"))  # type: ignore[arg-type]
-    except Exception:
-        return
-
-    store_key = f"zoom_ranges:{data_id}"
-    store = st.session_state.get(store_key)
-    if not isinstance(store, dict):
-        store = {}
-
-    entry = store.get(plot_index)
-    if not isinstance(entry, dict):
-        entry = {}
-
-    if evt.get("xautorange") is True:
-        entry.pop("x", None)
-    elif "x0" in evt and "x1" in evt:
-        try:
-            entry["x"] = [float(evt["x0"]), float(evt["x1"])]  # type: ignore[arg-type]
-        except Exception:
-            pass
-
-    if evt.get("yautorange") is True:
-        entry.pop("y", None)
-    elif "y0" in evt and "y1" in evt:
-        try:
-            entry["y"] = [float(evt["y0"]), float(evt["y1"])]  # type: ignore[arg-type]
-        except Exception:
-            pass
-
-    if entry:
-        store[plot_index] = entry
-    else:
-        store.pop(plot_index, None)
-
-    st.session_state[store_key] = store
-
-
-def _apply_saved_zoom(fig: go.Figure, plot_index: int, data_id: str) -> None:
-    store = st.session_state.get(f"zoom_ranges:{data_id}")
-    if not isinstance(store, dict):
-        return
-    entry = store.get(int(plot_index))
-    if not isinstance(entry, dict):
-        return
-
-    xr = entry.get("x")
-    yr = entry.get("y")
-    if isinstance(xr, list) and len(xr) == 2:
-        fig.update_xaxes(range=[float(xr[0]), float(xr[1])], autorange=False)
-    if isinstance(yr, list) and len(yr) == 2:
-        fig.update_yaxes(range=[float(yr[0]), float(yr[1])], autorange=False)
 
 
 def _clamp_int(val: int, lo: int, hi: int) -> int:
@@ -1021,20 +962,17 @@ def main():
     show_harmonics = st.sidebar.checkbox("Show harmonic lines", value=True)
     bin_width_hz = st.sidebar.number_input("Bin width (Hz)", min_value=0.0, value=0.0, step=1.0, help="0 disables tolerance bands")
 
-    # Capture last zoom/pan/reset from the browser and store it in session_state for this file.
+    # Client-side zoom persistence: bind to the 3 Streamlit Plotly charts and store axis ranges
+    # in the browser (localStorage). No Streamlit rerun is triggered by zooming.
     bind_nonce_key = f"zoom_bind_nonce:{data_id}"
     st.session_state[bind_nonce_key] = int(st.session_state.get(bind_nonce_key, 0)) + 1
 
-    relayout_evt = plotly_relayout_listener(
+    plotly_relayout_listener(
         data_id=data_id,
         plot_count=3,
         debounce_ms=150,
         nonce=int(st.session_state[bind_nonce_key]),
     )
-    _update_zoom_state_from_relayout(relayout_evt, data_id=data_id)
-    if DEBUG_ZOOM:
-        st.sidebar.write("relayout_evt:", relayout_evt)
-        st.sidebar.write("zoom_store:", st.session_state.get(f"zoom_ranges:{data_id}"))
 
     # Build plots
     r_title = "R1 (\u03A9)" if seq_label == "Positive" else "R0 (\u03A9)"
@@ -1090,11 +1028,6 @@ def main():
         fig.update_xaxes(range=[n_lo, n_hi])
         if harm_shapes:
             fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
-
-    # Reapply saved zoom (overrides the default n-range above).
-    _apply_saved_zoom(fig_x, plot_index=0, data_id=data_id)
-    _apply_saved_zoom(fig_r, plot_index=1, data_id=data_id)
-    _apply_saved_zoom(fig_xr, plot_index=2, data_id=data_id)
 
     # Render
     st.subheader(f"Sequence: {seq_label} | Base: {int(f_base)} Hz")
