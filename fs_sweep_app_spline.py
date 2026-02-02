@@ -43,9 +43,10 @@ STYLE = {
 }
 
 AUTO_WIDTH_ESTIMATE_PX = 950  # Estimate width when Plotly auto-sizes (used for legend row estimation only).
-WEB_LEGEND_MAX_HEIGHT_PX = 500  # Cap legend reserved area on-page to avoid huge gaps between charts.
+WEB_LEGEND_MAX_HEIGHT_PX = 300  # Cap legend reserved area on-page to avoid huge gaps between charts.
 DEFAULT_SPLINE_SMOOTHING = 1.0  # Default Plotly spline smoothing when spline mode is enabled.
 EXPORT_IMAGE_SCALE = 4  # PNG scale factor for both modebar and "Full Legend" export.
+WEB_LEGEND_EXTRA_PAD_PX = 12  # Extra breathing room to avoid clipping the last legend row on-page.
 
 # Debug flag (code-only). When True, prints the latest relayout payload and stored zoom.
 DEBUG_ZOOM = False
@@ -61,6 +62,7 @@ def plotly_relayout_listener(
     plot_count: int = 3,
     debounce_ms: int = 120,
     nonce: int = 0,
+    reset_token: int = 0,
 ) -> Optional[Dict[str, object]]:
     # Client-side zoom persistence: binds to Plotly charts and stores axis ranges
     # in browser localStorage. Returns None (no Python roundtrip on zoom).
@@ -69,9 +71,36 @@ def plotly_relayout_listener(
         plot_count=int(plot_count),
         debounce_ms=int(debounce_ms),
         nonce=int(nonce),
+        reset_token=int(reset_token),
         key=f"plotly_relayout_listener:{data_id}",
         default=None,
     )
+
+
+def _reset_case_filter_state() -> None:
+    # Case filter widgets use deterministic session_state keys; clear them when a new file is loaded
+    # so filters start from defaults for the new dataset.
+    for k in list(st.session_state.keys()):
+        if str(k).startswith("case_part_") or str(k).startswith("case_filters_"):
+            try:
+                del st.session_state[k]
+            except Exception:
+                pass
+
+
+def _note_upload_change() -> None:
+    # Called by st.file_uploader(on_change=...): used to trigger filter+zoom reset on any upload action.
+    st.session_state["upload_nonce"] = int(st.session_state.get("upload_nonce", 0)) + 1
+    up = st.session_state.get("xlsx_uploader")
+    if up is None:
+        st.session_state.pop("uploaded_file_sha1_10", None)
+        st.session_state.pop("uploaded_file_name", None)
+        return
+    try:
+        st.session_state["uploaded_file_sha1_10"] = hashlib.sha1(up.getvalue()).hexdigest()[:10]
+        st.session_state["uploaded_file_name"] = getattr(up, "name", None)
+    except Exception:
+        st.session_state.pop("uploaded_file_sha1_10", None)
 
 
 def _clamp_int(val: int, lo: int, hi: int) -> int:
@@ -515,7 +544,7 @@ def apply_common_layout(
     )
     est_width_px = int(figure_width_px) if not use_auto_width else int(AUTO_WIDTH_ESTIMATE_PX)
     legend_h_full = _estimate_legend_height_px(int(n_traces), est_width_px, int(legend_entrywidth))
-    legend_h = min(int(WEB_LEGEND_MAX_HEIGHT_PX), int(legend_h_full))
+    legend_h = min(int(WEB_LEGEND_MAX_HEIGHT_PX), int(legend_h_full) + int(WEB_LEGEND_EXTRA_PAD_PX))
     total_height = int(plot_height) + int(TOP_MARGIN_PX) + int(bottom_axis_px) + int(legend_h)
     legend_y = -float(bottom_axis_px) / float(max(1, int(plot_height)))
 
@@ -850,13 +879,20 @@ def main():
     # Data source
     default_path = "FS_sweep.xlsx"
     st.sidebar.header("Data Source")
-    up = st.sidebar.file_uploader("Upload Excel", type=["xlsx"], help="If empty, loads 'FS_sweep.xlsx' from this folder.")
+    up = st.sidebar.file_uploader(
+        "Upload Excel",
+        type=["xlsx"],
+        key="xlsx_uploader",
+        on_change=_note_upload_change,
+        help="If empty, loads 'FS_sweep.xlsx' from this folder.",
+    )
     data_id = "unknown"
     try:
         if up is not None:
             data = load_fs_sweep_xlsx(up)
             try:
-                data_id = hashlib.sha1(up.getvalue()).hexdigest()[:10]
+                cached = st.session_state.get("uploaded_file_sha1_10")
+                data_id = str(cached) if cached else hashlib.sha1(up.getvalue()).hexdigest()[:10]
             except Exception:
                 data_id = f"upload:{getattr(up, 'name', 'file')}"
         elif os.path.exists(default_path):
@@ -872,6 +908,17 @@ def main():
     except Exception as e:
         st.error(f"Failed to load Excel: {e}")
         st.stop()
+
+    # Reset case-part/location filters on:
+    # - any upload action (even if the same file is uploaded again)
+    # - a change of the effective loaded dataset (data_id)
+    last_upload_handled = int(st.session_state.get("upload_nonce_handled", 0))
+    upload_nonce = int(st.session_state.get("upload_nonce", 0))
+    prev_data_id = st.session_state.get("active_data_id")
+    if (upload_nonce != last_upload_handled) or (prev_data_id != data_id):
+        _reset_case_filter_state()
+        st.session_state["upload_nonce_handled"] = upload_nonce
+        st.session_state["active_data_id"] = data_id
 
     # Controls
     st.sidebar.header("Controls")
@@ -903,6 +950,14 @@ def main():
             key="spline_smoothing",
         )
 
+    st.sidebar.header("Show plots")
+    show_plot_x = st.sidebar.checkbox("X", value=True)
+    show_plot_r = st.sidebar.checkbox("R", value=False)
+    show_plot_xr = st.sidebar.checkbox("X/R", value=False)
+    if not (show_plot_x or show_plot_r or show_plot_xr):
+        st.warning("Select at least one plot to display (X, R, or X/R).")
+        st.stop()
+
     # Legend/Export controls
     st.sidebar.header("Legend & Export")
     auto_legend_entrywidth = st.sidebar.checkbox("Auto legend column width", value=True)
@@ -928,6 +983,13 @@ def main():
     if df_r is None and df_x is None:
         st.error(f"Missing sheets for sequence '{seq_label}' ({seq[0]}/{seq[1]}).")
         st.stop()
+    if (show_plot_r or show_plot_xr) and df_r is None:
+        st.error(f"Sheet '{seq[0]}' is missing, but R and/or X/R is enabled.")
+        st.stop()
+    if (show_plot_x or show_plot_xr) and df_x is None:
+        st.error(f"Sheet '{seq[1]}' is missing, but X and/or X/R is enabled.")
+        st.stop()
+
     all_cases = sorted(list({*list_case_columns(df_r), *list_case_columns(df_x)}))
     filtered_cases, part_labels = build_filters_for_case_parts(all_cases)
     if not filtered_cases:
@@ -964,114 +1026,149 @@ def main():
 
     # Client-side zoom persistence: bind to the 3 Streamlit Plotly charts and store axis ranges
     # in the browser (localStorage). No Streamlit rerun is triggered by zooming.
+    plot_order: List[str] = []
+    if show_plot_x:
+        plot_order.append("x")
+    if show_plot_r:
+        plot_order.append("r")
+    if show_plot_xr:
+        plot_order.append("xr")
+
     bind_nonce_key = f"zoom_bind_nonce:{data_id}"
     st.session_state[bind_nonce_key] = int(st.session_state.get(bind_nonce_key, 0)) + 1
 
     plotly_relayout_listener(
         data_id=data_id,
-        plot_count=3,
+        plot_count=len(plot_order),
         debounce_ms=150,
         nonce=int(st.session_state[bind_nonce_key]),
+        reset_token=int(upload_nonce),
     )
 
     # Build plots
     r_title = "R1 (\u03A9)" if seq_label == "Positive" else "R0 (\u03A9)"
     x_title = "X1 (\u03A9)" if seq_label == "Positive" else "X0 (\u03A9)"
-    fig_r, f_r = build_plot_spline(
-        df_r,
-        filtered_cases,
-        f_base,
-        plot_height,
-        r_title,
-        smooth,
-        enable_spline,
-        legend_entrywidth,
-        strip_location_suffix,
-        use_auto_width,
-        figure_width_px,
-        case_colors,
-    )
-    fig_x, f_x = build_plot_spline(
-        df_x,
-        filtered_cases,
-        f_base,
-        plot_height,
-        x_title,
-        smooth,
-        enable_spline,
-        legend_entrywidth,
-        strip_location_suffix,
-        use_auto_width,
-        figure_width_px,
-        case_colors,
-    )
-    fig_xr, f_xr, xr_dropped, xr_total = build_x_over_r_spline(
-        df_r,
-        df_x,
-        filtered_cases,
-        f_base,
-        plot_height,
-        seq_label,
-        smooth,
-        legend_entrywidth,
-        enable_spline,
-        strip_location_suffix,
-        use_auto_width,
-        figure_width_px,
-        case_colors,
-    )
+    plot_items: List[Dict[str, object]] = []
+    xr_dropped = 0
+    xr_total = 0
 
-    f_refs = [s for s in [f_r, f_x, f_xr] if s is not None]
+    if show_plot_x:
+        fig_x, f_x = build_plot_spline(
+            df_x,
+            filtered_cases,
+            f_base,
+            plot_height,
+            x_title,
+            smooth,
+            enable_spline,
+            legend_entrywidth,
+            strip_location_suffix,
+            use_auto_width,
+            figure_width_px,
+            case_colors,
+        )
+        plot_items.append(
+            {
+                "kind": "x",
+                "fig": fig_x,
+                "f_ref": f_x,
+                "filename": "X_full_legend.png",
+                "button_label": "X\nPNG",
+                "chart_key": "plot_x",
+            }
+        )
+
+    if show_plot_r:
+        fig_r, f_r = build_plot_spline(
+            df_r,
+            filtered_cases,
+            f_base,
+            plot_height,
+            r_title,
+            smooth,
+            enable_spline,
+            legend_entrywidth,
+            strip_location_suffix,
+            use_auto_width,
+            figure_width_px,
+            case_colors,
+        )
+        plot_items.append(
+            {
+                "kind": "r",
+                "fig": fig_r,
+                "f_ref": f_r,
+                "filename": "R_full_legend.png",
+                "button_label": "R\nPNG",
+                "chart_key": "plot_r",
+            }
+        )
+
+    if show_plot_xr:
+        fig_xr, f_xr, xr_dropped, xr_total = build_x_over_r_spline(
+            df_r,
+            df_x,
+            filtered_cases,
+            f_base,
+            plot_height,
+            seq_label,
+            smooth,
+            legend_entrywidth,
+            enable_spline,
+            strip_location_suffix,
+            use_auto_width,
+            figure_width_px,
+            case_colors,
+        )
+        plot_items.append(
+            {
+                "kind": "xr",
+                "fig": fig_xr,
+                "f_ref": f_xr,
+                "filename": "X_over_R_full_legend.png",
+                "button_label": "X/R\nPNG",
+                "chart_key": "plot_xr",
+            }
+        )
+
+    f_refs = [it["f_ref"] for it in plot_items if it.get("f_ref") is not None]
     n_lo, n_hi = compute_common_n_range(f_refs, f_base)
     harm_shapes = build_harmonic_shapes(n_lo, n_hi, f_base, show_harmonics, bin_width_hz)
-    for fig in (fig_r, fig_x, fig_xr):
-        fig.update_xaxes(range=[n_lo, n_hi])
-        if harm_shapes:
-            fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
+    for it in plot_items:
+        fig = it["fig"]
+        if isinstance(fig, go.Figure):
+            fig.update_xaxes(range=[n_lo, n_hi])
+            if harm_shapes:
+                fig.update_layout(shapes=(fig.layout.shapes + harm_shapes) if fig.layout.shapes else harm_shapes)
 
     # Render
     st.subheader(f"Sequence: {seq_label} | Base: {int(f_base)} Hz")
-    if xr_total > 0 and xr_dropped > 0:
+    if show_plot_xr and xr_total > 0 and xr_dropped > 0:
         st.caption(f"X/R: dropped {xr_dropped} of {xr_total} points where |R| < 1e-9 or data missing.")
 
     export_scale = int(EXPORT_IMAGE_SCALE)
     with download_area:
         st.subheader("Download (Full Legend)")
         st.caption("Browser PNG download (temporarily expands the on-page chart legend, then downloads).")
-        cols = st.columns(3)
-        with cols[0]:
-            _render_client_png_download(
-                filename="X_full_legend.png",
-                scale=export_scale,
-                button_label="X\nPNG",
-                plot_height=plot_height,
-                legend_entrywidth=legend_entrywidth,
-                plot_index=0,
-            )
-        with cols[1]:
-            _render_client_png_download(
-                filename="R_full_legend.png",
-                scale=export_scale,
-                button_label="R\nPNG",
-                plot_height=plot_height,
-                legend_entrywidth=legend_entrywidth,
-                plot_index=1,
-            )
-        with cols[2]:
-            _render_client_png_download(
-                filename="X_over_R_full_legend.png",
-                scale=export_scale,
-                button_label="X/R\nPNG",
-                plot_height=plot_height,
-                legend_entrywidth=legend_entrywidth,
-                plot_index=2,
-            )
+        cols = st.columns(len(plot_items))
+        for idx, it in enumerate(plot_items):
+            with cols[idx]:
+                _render_client_png_download(
+                    filename=str(it["filename"]),
+                    scale=export_scale,
+                    button_label=str(it["button_label"]),
+                    plot_height=plot_height,
+                    legend_entrywidth=legend_entrywidth,
+                    plot_index=int(idx),
+                )
 
-    st.plotly_chart(fig_x, use_container_width=bool(use_auto_width), config=download_config, key="plot_x")
-    st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
-    st.plotly_chart(fig_r, use_container_width=bool(use_auto_width), config=download_config, key="plot_r")
-    st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
-    st.plotly_chart(fig_xr, use_container_width=bool(use_auto_width), config=download_config, key="plot_xr")
+    for idx, it in enumerate(plot_items):
+        fig = it["fig"]
+        chart_key = str(it["chart_key"])
+        if isinstance(fig, go.Figure):
+            st.plotly_chart(fig, use_container_width=bool(use_auto_width), config=download_config, key=chart_key)
+        if idx < len(plot_items) - 1:
+            st.markdown("<div style='height:36px'></div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
