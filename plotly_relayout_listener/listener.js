@@ -167,6 +167,10 @@ function bindOne(gd, idx, dataId) {
     }
   } catch (e) {}
 
+  try {
+    gd.__fsBindTimeMs = nowMs();
+  } catch (e) {}
+
   const handler = (evt) => {
     try {
       if (gd.__fsApplyingZoom) return;
@@ -194,6 +198,19 @@ function bindOne(gd, idx, dataId) {
       ) {
         return;
       }
+
+      // Streamlit reruns remount Plotly charts. Plotly often emits an initial relayout during
+      // mount (autorange=true) before we get a chance to reapply stored zoom. Ignore autorange-only
+      // relayout events immediately after binding so we don't accidentally clear saved zoom on rerun.
+      try {
+        const boundAt = Number(gd.__fsBindTimeMs || 0);
+        const age = nowMs() - boundAt;
+        const autorangeOnly =
+          (payload.xautorange === true || payload.yautorange === true) &&
+          payload.x0 === undefined &&
+          payload.y0 === undefined;
+        if (autorangeOnly && age >= 0 && age < 1200) return;
+      } catch (e) {}
 
       const key = storageKey(dataId, idx);
       const existingRaw = safeLocalStorageGet(key);
