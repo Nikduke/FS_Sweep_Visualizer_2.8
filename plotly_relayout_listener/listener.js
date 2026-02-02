@@ -20,6 +20,9 @@ let latestArgs = null;
 let debounceMs = 120;
 let lastDataId = null;
 let saveTimersByKey = new Map();
+let lastResetToken = null;
+let rebindObserver = null;
+let rebindWarnTimer = null;
 
 function nowMs() {
   return Date.now ? Date.now() : new Date().getTime();
@@ -220,6 +223,8 @@ function bindOne(gd, idx, dataId) {
 
   try {
     gd.__fsRelayoutHandler = handler;
+    gd.__fsRelayoutDataId = String(dataId);
+    gd.__fsRelayoutIndex = Number(idx);
   } catch (e) {}
   gd.on("plotly_relayout", handler);
   applyStoredZoomIfAny(gd, idx, dataId);
@@ -234,13 +239,83 @@ function syncBindings() {
   for (let i = 0; i < n; i++) bindOne(plots[i], i, dataId);
 }
 
+function bindingsComplete() {
+  if (!latestArgs) return false;
+  const plotCount = Number(latestArgs.plot_count || 3);
+  const dataId = String(latestArgs.data_id || "");
+  const plots = getPlotDivs();
+  if (plots.length < plotCount) return false;
+  for (let i = 0; i < plotCount; i++) {
+    const gd = plots[i];
+    if (!gd) return false;
+    if (!gd.__fsRelayoutHandler) return false;
+    if (String(gd.__fsRelayoutDataId || "") !== dataId) return false;
+    if (Number(gd.__fsRelayoutIndex) !== i) return false;
+  }
+  return true;
+}
+
 function kickRebindLoop() {
-  let tries = 0;
-  (function tick() {
+  // Robust binding: Streamlit can remount Plotly charts after reruns, and on slow loads
+  // the charts might appear later than a fixed retry loop. Use a MutationObserver where
+  // available, plus a bounded polling fallback.
+  try {
+    if (rebindObserver) {
+      try {
+        rebindObserver.disconnect();
+      } catch (e) {}
+      rebindObserver = null;
+    }
+    if (rebindWarnTimer) {
+      clearTimeout(rebindWarnTimer);
+      rebindWarnTimer = null;
+    }
+  } catch (e) {}
+
+  const start = nowMs();
+  const deadlineMs = 20000; // max time to keep trying (slow cloud renders)
+
+  const tick = () => {
     syncBindings();
+    if (bindingsComplete()) return true;
+    if (nowMs() - start >= deadlineMs) return false;
+    return null;
+  };
+
+  // Poll quickly at first (covers most cases), then observer keeps us responsive to late mounts.
+  let tries = 0;
+  (function poll() {
+    const ok = tick();
+    if (ok === true) return;
+    if (ok === false) return;
     tries += 1;
-    if (tries < 80) setTimeout(tick, 100);
+    if (tries < 100) setTimeout(poll, 100);
   })();
+
+  try {
+    const parentDoc = (window.parent || window).document;
+    const root = parentDoc && parentDoc.body ? parentDoc.body : parentDoc;
+    if (root && window.MutationObserver) {
+      rebindObserver = new MutationObserver(() => {
+        const ok = tick();
+        if (ok === true || ok === false) {
+          try {
+            rebindObserver.disconnect();
+          } catch (e) {}
+          rebindObserver = null;
+        }
+      });
+      rebindObserver.observe(root, { childList: true, subtree: true });
+    }
+  } catch (e) {}
+
+  rebindWarnTimer = setTimeout(() => {
+    try {
+      if (!bindingsComplete() && console && console.warn) {
+        console.warn("[fsSweep] plotly_relayout_listener: failed to bind to Plotly charts within 20s (zoom persistence may not work).");
+      }
+    } catch (e) {}
+  }, deadlineMs);
 }
 
 window.addEventListener("message", (event) => {
@@ -255,6 +330,28 @@ window.addEventListener("message", (event) => {
     if (lastDataId !== newDataId) {
       lastDataId = newDataId;
       saveTimersByKey = new Map();
+    }
+  } catch (e) {}
+
+  // If Python indicates an upload reset, clear stored zoom for this data_id so charts start autoscaled.
+  try {
+    const resetTok = Number(latestArgs.reset_token || 0);
+    const dataId = String(latestArgs.data_id || "");
+    if (lastResetToken !== resetTok) {
+      lastResetToken = resetTok;
+      if (dataId) {
+        const prefix = `fsSweepZoom:${dataId}:`;
+        const toDelete = [];
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const k = window.localStorage.key(i);
+          if (k && k.startsWith(prefix)) toDelete.push(k);
+        }
+        for (const k of toDelete) {
+          try {
+            window.localStorage.removeItem(k);
+          } catch (e2) {}
+        }
+      }
     }
   } catch (e) {}
   try {
